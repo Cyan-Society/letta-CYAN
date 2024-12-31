@@ -3,43 +3,21 @@ import warnings
 from datetime import datetime
 from typing import List, Optional, Union
 
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Body,
-    Depends,
-    Header,
-    HTTPException,
-    Query,
-    status,
-)
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 
 from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG
+from letta.log import get_logger
 from letta.orm.errors import NoResultFound
 from letta.schemas.agent import AgentState, CreateAgent, UpdateAgent
-from letta.schemas.block import (  # , BlockLabelUpdate, BlockLimitUpdate
-    Block,
-    BlockUpdate,
-    CreateBlock,
-)
+from letta.schemas.block import Block, BlockUpdate, CreateBlock  # , BlockLabelUpdate, BlockLimitUpdate
 from letta.schemas.enums import MessageStreamStatus
 from letta.schemas.job import Job, JobStatus, JobUpdate
-from letta.schemas.letta_message import (
-    LegacyLettaMessage,
-    LettaMessage,
-    LettaMessageUnion,
-)
+from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, LettaMessageUnion
 from letta.schemas.letta_request import LettaRequest, LettaStreamingRequest
 from letta.schemas.letta_response import LettaResponse
-from letta.schemas.memory import (
-    ArchivalMemorySummary,
-    ContextWindowOverview,
-    CreateArchivalMemory,
-    Memory,
-    RecallMemorySummary,
-)
+from letta.schemas.memory import ArchivalMemorySummary, ContextWindowOverview, CreateArchivalMemory, Memory, RecallMemorySummary
 from letta.schemas.message import Message, MessageCreate, MessageUpdate
 from letta.schemas.passage import Passage
 from letta.schemas.source import Source
@@ -53,6 +31,8 @@ from letta.server.server import SyncServer
 
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+
+logger = get_logger(__name__)
 
 
 # TODO: This should be paginated
@@ -101,7 +81,7 @@ def get_agent_context_window(
     """
     actor = server.user_manager.get_user_or_default(user_id=user_id)
 
-    return server.get_agent_context_window(user_id=actor.id, agent_id=agent_id)
+    return server.get_agent_context_window(agent_id=agent_id, actor=actor)
 
 
 class CreateAgentRequest(CreateAgent):
@@ -135,7 +115,7 @@ def update_agent(
 ):
     """Update an exsiting agent"""
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.update_agent(agent_id, update_agent, actor=actor)
+    return server.agent_manager.update_agent(agent_id=agent_id, agent_update=update_agent, actor=actor)
 
 
 @router.get("/{agent_id}/tools", response_model=List[Tool], operation_id="get_tools_from_agent")
@@ -146,7 +126,7 @@ def get_tools_from_agent(
 ):
     """Get tools from an existing agent"""
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.get_tools_from_agent(agent_id=agent_id, user_id=actor.id)
+    return server.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor).tools
 
 
 @router.patch("/{agent_id}/add-tool/{tool_id}", response_model=AgentState, operation_id="add_tool_to_agent")
@@ -158,7 +138,7 @@ def add_tool_to_agent(
 ):
     """Add tools to an existing agent"""
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.add_tool_to_agent(agent_id=agent_id, tool_id=tool_id, user_id=actor.id)
+    return server.agent_manager.attach_tool(agent_id=agent_id, tool_id=tool_id, actor=actor)
 
 
 @router.patch("/{agent_id}/remove-tool/{tool_id}", response_model=AgentState, operation_id="remove_tool_from_agent")
@@ -170,7 +150,7 @@ def remove_tool_from_agent(
 ):
     """Add tools to an existing agent"""
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.remove_tool_from_agent(agent_id=agent_id, tool_id=tool_id, user_id=actor.id)
+    return server.agent_manager.detach_tool(agent_id=agent_id, tool_id=tool_id, actor=actor)
 
 
 @router.get("/{agent_id}", response_model=AgentState, operation_id="get_agent")
@@ -190,7 +170,7 @@ def get_agent_state(
         raise HTTPException(status_code=404, detail=str(e))
 
 
-@router.delete("/{agent_id}", response_model=AgentState, operation_id="delete_agent")
+@router.delete("/{agent_id}", response_model=None, operation_id="delete_agent")
 def delete_agent(
     agent_id: str,
     server: "SyncServer" = Depends(get_letta_server),
@@ -201,7 +181,8 @@ def delete_agent(
     """
     actor = server.user_manager.get_user_or_default(user_id=user_id)
     try:
-        return server.agent_manager.delete_agent(agent_id=agent_id, actor=actor)
+        server.agent_manager.delete_agent(agent_id=agent_id, actor=actor)
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"message": f"Agent id={agent_id} successfully deleted"})
     except NoResultFound:
         raise HTTPException(status_code=404, detail=f"Agent agent_id={agent_id} not found for user_id={actor.id}.")
 
@@ -229,7 +210,7 @@ def get_agent_in_context_messages(
     Retrieve the messages in the context of a specific agent.
     """
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.get_in_context_messages(agent_id=agent_id, actor=actor)
+    return server.agent_manager.get_in_context_messages(agent_id=agent_id, actor=actor)
 
 
 # TODO: remove? can also get with agent blocks
@@ -340,7 +321,12 @@ def update_agent_memory_block(
     actor = server.user_manager.get_user_or_default(user_id=user_id)
 
     block = server.agent_manager.get_block_with_label(agent_id=agent_id, block_label=block_label, actor=actor)
-    return server.block_manager.update_block(block.id, block_update=block_update, actor=actor)
+    block = server.block_manager.update_block(block.id, block_update=block_update, actor=actor)
+
+    # This should also trigger a system prompt change in the agent
+    server.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor, force=True, update_timestamp=False)
+
+    return block
 
 
 @router.get("/{agent_id}/memory/recall", response_model=RecallMemorySummary, operation_id="get_agent_recall_memory_summary")
@@ -426,7 +412,7 @@ def delete_agent_archival_memory(
     """
     actor = server.user_manager.get_user_or_default(user_id=user_id)
 
-    server.delete_archival_memory(agent_id=agent_id, memory_id=memory_id, actor=actor)
+    server.delete_archival_memory(memory_id=memory_id, actor=actor)
     return JSONResponse(status_code=status.HTTP_200_OK, content={"message": f"Memory id={memory_id} successfully deleted"})
 
 
@@ -476,8 +462,9 @@ def update_message(
     """
     Update the details of a message associated with an agent.
     """
+    # TODO: Get rid of agent_id here, it's not really relevant
     actor = server.user_manager.get_user_or_default(user_id=user_id)
-    return server.update_agent_message(agent_id=agent_id, message_id=message_id, request=request, actor=actor)
+    return server.message_manager.update_message_by_id(message_id=message_id, message_update=request, actor=actor)
 
 
 @router.post(

@@ -1,12 +1,7 @@
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-from composio.client.collections import (
-    ActionModel,
-    ActionParametersModel,
-    ActionResponseModel,
-    AppModel,
-)
+from composio.client.collections import ActionModel, ActionParametersModel, ActionResponseModel, AppModel
 from fastapi.testclient import TestClient
 
 from letta.schemas.tool import ToolCreate, ToolUpdate
@@ -272,15 +267,15 @@ def test_update_tool(client, mock_sync_server, update_integers_tool, add_integer
     )
 
 
-def test_add_base_tools(client, mock_sync_server, add_integers_tool):
-    mock_sync_server.tool_manager.add_base_tools.return_value = [add_integers_tool]
+def test_upsert_base_tools(client, mock_sync_server, add_integers_tool):
+    mock_sync_server.tool_manager.upsert_base_tools.return_value = [add_integers_tool]
 
     response = client.post("/v1/tools/add-base-tools", headers={"user_id": "test_user"})
 
     assert response.status_code == 200
     assert len(response.json()) == 1
     assert response.json()[0]["id"] == add_integers_tool.id
-    mock_sync_server.tool_manager.add_base_tools.assert_called_once_with(
+    mock_sync_server.tool_manager.upsert_base_tools.assert_called_once_with(
         actor=mock_sync_server.user_manager.get_user_or_default.return_value
     )
 

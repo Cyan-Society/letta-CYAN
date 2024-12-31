@@ -6,24 +6,13 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from letta.constants import (
-    DEFAULT_MESSAGE_TOOL,
-    DEFAULT_MESSAGE_TOOL_KWARG,
-    TOOL_CALL_ID_MAX_LEN,
-)
+from letta.constants import DEFAULT_MESSAGE_TOOL, DEFAULT_MESSAGE_TOOL_KWARG, TOOL_CALL_ID_MAX_LEN
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_base import OrmMetadataBase
-from letta.schemas.letta_message import (
-    AssistantMessage,
-    FunctionCall,
-    FunctionCallMessage,
-    FunctionReturn,
-    InternalMonologue,
-    LettaMessage,
-    SystemMessage,
-    UserMessage,
-)
+from letta.schemas.letta_message import AssistantMessage, LettaMessage, ReasoningMessage, SystemMessage
+from letta.schemas.letta_message import ToolCall as LettaToolCall
+from letta.schemas.letta_message import ToolCallMessage, ToolReturnMessage, UserMessage
 from letta.schemas.openai.chat_completions import ToolCall, ToolCallFunction
 from letta.utils import get_utc_time, is_utc_datetime, json_dumps
 
@@ -145,10 +134,10 @@ class Message(BaseMessage):
             if self.text is not None:
                 # This is type InnerThoughts
                 messages.append(
-                    InternalMonologue(
+                    ReasoningMessage(
                         id=self.id,
                         date=self.created_at,
-                        internal_monologue=self.text,
+                        reasoning=self.text,
                     )
                 )
             if self.tool_calls is not None:
@@ -172,18 +161,18 @@ class Message(BaseMessage):
                         )
                     else:
                         messages.append(
-                            FunctionCallMessage(
+                            ToolCallMessage(
                                 id=self.id,
                                 date=self.created_at,
-                                function_call=FunctionCall(
+                                tool_call=LettaToolCall(
                                     name=tool_call.function.name,
                                     arguments=tool_call.function.arguments,
-                                    function_call_id=tool_call.id,
+                                    tool_call_id=tool_call.id,
                                 ),
                             )
                         )
         elif self.role == MessageRole.tool:
-            # This is type FunctionReturn
+            # This is type ToolReturnMessage
             # Try to interpret the function return, recall that this is how we packaged:
             # def package_function_response(was_success, response_string, timestamp=None):
             #     formatted_time = get_local_time() if timestamp is None else timestamp
@@ -208,12 +197,12 @@ class Message(BaseMessage):
             messages.append(
                 # TODO make sure this is what the API returns
                 # function_return may not match exactly...
-                FunctionReturn(
+                ToolReturnMessage(
                     id=self.id,
                     date=self.created_at,
-                    function_return=self.text,
+                    tool_return=self.text,
                     status=status_enum,
-                    function_call_id=self.tool_call_id,
+                    tool_call_id=self.tool_call_id,
                 )
             )
         elif self.role == MessageRole.user:

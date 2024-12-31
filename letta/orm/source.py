@@ -11,7 +11,10 @@ from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.source import Source as PydanticSource
 
 if TYPE_CHECKING:
+    from letta.orm.agent import Agent
+    from letta.orm.file import FileMetadata
     from letta.orm.organization import Organization
+    from letta.orm.passage import SourcePassage
 
 
 class Source(SqlalchemyBase, OrganizationMixin):
@@ -28,4 +31,12 @@ class Source(SqlalchemyBase, OrganizationMixin):
     # relationships
     organization: Mapped["Organization"] = relationship("Organization", back_populates="sources")
     files: Mapped[List["FileMetadata"]] = relationship("FileMetadata", back_populates="source", cascade="all, delete-orphan")
-    agents: Mapped[List["Agent"]] = relationship("Agent", secondary="sources_agents", back_populates="sources")
+    passages: Mapped[List["SourcePassage"]] = relationship("SourcePassage", back_populates="source", cascade="all, delete-orphan")
+    agents: Mapped[List["Agent"]] = relationship(
+        "Agent",
+        secondary="sources_agents",
+        back_populates="sources",
+        lazy="selectin",
+        cascade="all, delete",  # Ensures rows in sources_agents are deleted when the source is deleted
+        passive_deletes=True,  # Allows the database to handle deletion of orphaned rows
+    )

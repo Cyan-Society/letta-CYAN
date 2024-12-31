@@ -4,11 +4,7 @@ from typing import Any, List, Optional
 import numpy as np
 import tiktoken
 
-from letta.constants import (
-    EMBEDDING_TO_TOKENIZER_DEFAULT,
-    EMBEDDING_TO_TOKENIZER_MAP,
-    MAX_EMBEDDING_DIM,
-)
+from letta.constants import EMBEDDING_TO_TOKENIZER_DEFAULT, EMBEDDING_TO_TOKENIZER_MAP, MAX_EMBEDDING_DIM
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.utils import is_valid_url, printd
 
@@ -234,16 +230,10 @@ def embedding_model(config: EmbeddingConfig, user_id: Optional[uuid.UUID] = None
         )
     elif endpoint_type == "ollama":
 
-        from llama_index.embeddings.ollama import OllamaEmbedding
-
-        ollama_additional_kwargs = {}
-        callback_manager = None
-
-        model = OllamaEmbedding(
-            model_name=config.embedding_model,
+        model = OllamaEmbeddings(
+            model=config.embedding_model,
             base_url=config.embedding_endpoint,
-            ollama_additional_kwargs=ollama_additional_kwargs or {},
-            callback_manager=callback_manager or None,
+            ollama_additional_kwargs={},
         )
         return model
 

@@ -5,41 +5,25 @@ from typing import List, Optional, Union
 import requests
 
 from letta.constants import CLI_WARNING_PREFIX
-from letta.errors import LettaConfigurationError
+from letta.errors import LettaConfigurationError, RateLimitExceededError
 from letta.llm_api.anthropic import anthropic_chat_completions_request
 from letta.llm_api.azure_openai import azure_openai_chat_completions_request
-from letta.llm_api.google_ai import (
-    convert_tools_to_google_ai_format,
-    google_ai_chat_completions_request,
-)
-from letta.llm_api.helpers import (
-    add_inner_thoughts_to_functions,
-    unpack_all_inner_thoughts_from_kwargs,
-)
+from letta.llm_api.google_ai import convert_tools_to_google_ai_format, google_ai_chat_completions_request
+from letta.llm_api.helpers import add_inner_thoughts_to_functions, unpack_all_inner_thoughts_from_kwargs
 from letta.llm_api.openai import (
     build_openai_chat_completions_request,
     openai_chat_completions_process_stream,
     openai_chat_completions_request,
 )
 from letta.local_llm.chat_completion_proxy import get_chat_completion
-from letta.local_llm.constants import (
-    INNER_THOUGHTS_KWARG,
-    INNER_THOUGHTS_KWARG_DESCRIPTION,
-)
+from letta.local_llm.constants import INNER_THOUGHTS_KWARG, INNER_THOUGHTS_KWARG_DESCRIPTION
 from letta.local_llm.utils import num_tokens_from_functions, num_tokens_from_messages
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
-from letta.schemas.openai.chat_completion_request import (
-    ChatCompletionRequest,
-    Tool,
-    cast_message_to_subtype,
-)
+from letta.schemas.openai.chat_completion_request import ChatCompletionRequest, Tool, cast_message_to_subtype
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
 from letta.settings import ModelSettings
-from letta.streaming_interface import (
-    AgentChunkStreamingInterface,
-    AgentRefreshStreamingInterface,
-)
+from letta.streaming_interface import AgentChunkStreamingInterface, AgentRefreshStreamingInterface
 
 LLM_API_PROVIDER_OPTIONS = ["openai", "azure", "anthropic", "google_ai", "cohere", "local", "groq"]
 
@@ -80,7 +64,7 @@ def retry_with_exponential_backoff(
 
                     # Check if max retries has been reached
                     if num_retries > max_retries:
-                        raise Exception(f"Maximum number of retries ({max_retries}) exceeded.")
+                        raise RateLimitExceededError("Maximum number of retries exceeded", max_retries=max_retries)
 
                     # Increment the delay
                     delay *= exponential_base * (1 + jitter * random.random())
@@ -110,9 +94,10 @@ def create(
     user_id: Optional[str] = None,  # option UUID to associate request with
     functions: Optional[list] = None,
     functions_python: Optional[dict] = None,
-    function_call: str = "auto",
+    function_call: Optional[str] = None,  # see: https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
     # hint
     first_message: bool = False,
+    force_tool_call: Optional[str] = None,  # Force a specific tool to be called
     # use tool naming?
     # if false, will use deprecated 'functions' style
     use_tool_naming: bool = True,
@@ -147,9 +132,18 @@ def create(
 
     # openai
     if llm_config.model_endpoint_type == "openai":
+
         if model_settings.openai_api_key is None and llm_config.model_endpoint == "https://api.openai.com/v1":
             # only is a problem if we are *not* using an openai proxy
             raise LettaConfigurationError(message="OpenAI key is missing from letta config file", missing_fields=["openai_api_key"])
+
+        if function_call is None and functions is not None and len(functions) > 0:
+            # force function calling for reliability, see https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
+            # TODO(matt) move into LLMConfig
+            if llm_config.model_endpoint == "https://inference.memgpt.ai":
+                function_call = "auto"  # TODO change to "required" once proxy supports it
+            else:
+                function_call = "required"
 
         data = build_openai_chat_completions_request(llm_config, messages, user_id, functions, function_call, use_tool_naming, max_tokens)
         if stream:  # Client requested token streaming
@@ -252,6 +246,11 @@ def create(
         if not use_tool_naming:
             raise NotImplementedError("Only tool calling supported on Anthropic API requests")
 
+        tool_call = None
+        if force_tool_call is not None:
+            tool_call = {"type": "function", "function": {"name": force_tool_call}}
+            assert functions is not None
+
         return anthropic_chat_completions_request(
             url=llm_config.model_endpoint,
             api_key=model_settings.anthropic_api_key,
@@ -259,7 +258,7 @@ def create(
                 model=llm_config.model,
                 messages=[cast_message_to_subtype(m.to_openai_dict()) for m in messages],
                 tools=[{"type": "function", "function": f} for f in functions] if functions else None,
-                # tool_choice=function_call,
+                tool_choice=tool_call,
                 # user=str(user_id),
                 # NOTE: max_tokens is required for Anthropic API
                 max_tokens=1024,  # TODO make dynamic

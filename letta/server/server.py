@@ -4,7 +4,6 @@ import os
 import traceback
 import warnings
 from abc import abstractmethod
-from asyncio import Lock
 from datetime import datetime
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -19,7 +18,6 @@ from letta.agent import Agent, save_agent
 from letta.chat_only_agent import ChatOnlyAgent
 from letta.credentials import LettaCredentials
 from letta.data_sources.connectors import DataConnector, load_data
-from letta.errors import LettaAgentNotFoundError
 
 # TODO use custom interface
 from letta.interface import AgentInterface  # abstract
@@ -42,26 +40,22 @@ from letta.providers import (
     VLLMChatCompletionsProvider,
     VLLMCompletionsProvider,
 )
-from letta.schemas.agent import AgentState, AgentType, CreateAgent, UpdateAgent
+from letta.schemas.agent import AgentState, AgentType, CreateAgent
 from letta.schemas.block import BlockUpdate
 from letta.schemas.embedding_config import EmbeddingConfig
 
 # openai schemas
 from letta.schemas.enums import JobStatus
 from letta.schemas.job import Job, JobUpdate
-from letta.schemas.letta_message import FunctionReturn, LettaMessage
+from letta.schemas.letta_message import LettaMessage, ToolReturnMessage
 from letta.schemas.llm_config import LLMConfig
-from letta.schemas.memory import (
-    ArchivalMemorySummary,
-    ContextWindowOverview,
-    Memory,
-    RecallMemorySummary,
-)
+from letta.schemas.memory import ArchivalMemorySummary, ContextWindowOverview, Memory, RecallMemorySummary
 from letta.schemas.message import Message, MessageCreate, MessageRole, MessageUpdate
 from letta.schemas.organization import Organization
 from letta.schemas.passage import Passage
+from letta.schemas.sandbox_config import SandboxEnvironmentVariableCreate, SandboxType
 from letta.schemas.source import Source
-from letta.schemas.tool import Tool, ToolCreate
+from letta.schemas.tool import Tool
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
 from letta.services.agent_manager import AgentManager
@@ -76,7 +70,7 @@ from letta.services.source_manager import SourceManager
 from letta.services.tool_execution_sandbox import ToolExecutionSandbox
 from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
-from letta.utils import get_utc_time, json_dumps, json_loads
+from letta.utils import get_friendly_error_msg, get_utc_time, json_dumps, json_loads
 
 logger = get_logger(__name__)
 
@@ -192,7 +186,14 @@ if settings.letta_pg_uri_no_default:
     config.archival_storage_uri = settings.letta_pg_uri_no_default
 
     # create engine
-    engine = create_engine(settings.letta_pg_uri)
+    engine = create_engine(
+        settings.letta_pg_uri,
+        pool_size=settings.pg_pool_size,
+        max_overflow=settings.pg_max_overflow,
+        pool_timeout=settings.pg_pool_timeout,
+        pool_recycle=settings.pg_pool_recycle,
+        echo=settings.pg_echo,
+    )
 else:
     # TODO: don't rely on config storage
     engine = create_engine("sqlite:///" + os.path.join(config.recall_storage_path, "sqlite.db"))
@@ -266,9 +267,6 @@ class SyncServer(Server):
 
         self.credentials = LettaCredentials.load()
 
-        # Locks
-        self.send_message_lock = Lock()
-
         # Initialize the metadata store
         config = LettaConfig.load()
         if settings.letta_pg_uri_no_default:
@@ -299,12 +297,18 @@ class SyncServer(Server):
             self.default_org = self.organization_manager.create_default_organization()
             self.default_user = self.user_manager.create_default_user()
             self.block_manager.add_default_blocks(actor=self.default_user)
-            self.tool_manager.add_base_tools(actor=self.default_user)
+            self.tool_manager.upsert_base_tools(actor=self.default_user)
 
-            # If there is a default org/user
-            # This logic may have to change in the future
-            if settings.load_default_external_tools:
-                self.add_default_external_tools(actor=self.default_user)
+            # Add composio keys to the tool sandbox env vars of the org
+            if tool_settings.composio_api_key:
+                manager = SandboxConfigManager(tool_settings)
+                sandbox_config = manager.get_or_create_default_sandbox_config(sandbox_type=SandboxType.LOCAL, actor=self.default_user)
+
+                manager.create_sandbox_env_var(
+                    SandboxEnvironmentVariableCreate(key="COMPOSIO_API_KEY", value=tool_settings.composio_api_key),
+                    sandbox_config_id=sandbox_config.id,
+                    actor=self.default_user,
+                )
 
         # collect providers (always has Letta as a default)
         self._enabled_providers: List[Provider] = [LettaProvider()]
@@ -374,33 +378,11 @@ class SyncServer(Server):
                 )
             )
 
-    def initialize_agent(self, agent_id, actor, interface: Union[AgentInterface, None] = None, initial_message_sequence=None) -> Agent:
-        """Initialize an agent from the database"""
-        agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
-
-        interface = interface or self.default_interface_factory()
-        if agent_state.agent_type == AgentType.memgpt_agent:
-            agent = Agent(agent_state=agent_state, interface=interface, user=actor, initial_message_sequence=initial_message_sequence)
-        elif agent_state.agent_type == AgentType.offline_memory_agent:
-            agent = OfflineMemoryAgent(
-                agent_state=agent_state, interface=interface, user=actor, initial_message_sequence=initial_message_sequence
-            )
-        else:
-            assert initial_message_sequence is None, f"Initial message sequence is not supported for O1Agents"
-            agent = O1Agent(agent_state=agent_state, interface=interface, user=actor)
-
-        # Persist to agent
-        save_agent(agent)
-        return agent
-
     def load_agent(self, agent_id: str, actor: User, interface: Union[AgentInterface, None] = None) -> Agent:
         """Updated method to load agents from persisted storage"""
         agent_lock = self.per_agent_lock_manager.get_lock(agent_id)
         with agent_lock:
             agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
-
-            if agent_state is None:
-                raise LettaAgentNotFoundError(f"Agent (agent_id={agent_id}) does not exist")
 
             interface = interface or self.default_interface_factory()
             if agent_state.agent_type == AgentType.memgpt_agent:
@@ -414,11 +396,6 @@ class SyncServer(Server):
             else:
                 raise ValueError(f"Invalid agent type {agent_state.agent_type}")
 
-            # Rebuild the system prompt - may be linked to new blocks now
-            agent.rebuild_system_prompt()
-
-            # Persist to agent
-            save_agent(agent)
             return agent
 
     def _step(
@@ -455,9 +432,6 @@ class SyncServer(Server):
                 stream=token_streaming,
                 skip_verify=True,
             )
-
-            # save agent after step
-            save_agent(letta_agent)
 
         except Exception as e:
             logger.error(f"Error in server._step: {e}")
@@ -777,228 +751,46 @@ class SyncServer(Server):
         # interface
         interface: Union[AgentInterface, None] = None,
     ) -> AgentState:
+        if request.llm_config is None:
+            if request.llm is None:
+                raise ValueError("Must specify either llm or llm_config in request")
+            request.llm_config = self.get_llm_config_from_handle(handle=request.llm, context_window_limit=request.context_window_limit)
+
+        if request.embedding_config is None:
+            if request.embedding is None:
+                raise ValueError("Must specify either embedding or embedding_config in request")
+            request.embedding_config = self.get_embedding_config_from_handle(
+                handle=request.embedding, embedding_chunk_size=request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE
+            )
+
         """Create a new agent using a config"""
         # Invoke manager
-        agent_state = self.agent_manager.create_agent(
+        return self.agent_manager.create_agent(
             agent_create=request,
             actor=actor,
         )
 
-        # create the agent object
-        if request.initial_message_sequence is not None:
-            # init_messages = [Message(user_id=user_id, agent_id=agent_state.id, role=message.role, text=message.text) for message in request.initial_message_sequence]
-            init_messages = []
-            for message in request.initial_message_sequence:
-
-                if message.role == MessageRole.user:
-                    packed_message = system.package_user_message(
-                        user_message=message.text,
-                    )
-                elif message.role == MessageRole.system:
-                    packed_message = system.package_system_message(
-                        system_message=message.text,
-                    )
-                else:
-                    raise ValueError(f"Invalid message role: {message.role}")
-
-                init_messages.append(Message(role=message.role, text=packed_message, agent_id=agent_state.id))
-            # init_messages = [Message.dict_to_message(user_id=user_id, agent_id=agent_state.id, openai_message_dict=message.model_dump()) for message in request.initial_message_sequence]
-        else:
-            init_messages = None
-
-        # initialize the agent (generates initial message list with system prompt)
-        if interface is None:
-            interface = self.default_interface_factory()
-        self.initialize_agent(agent_id=agent_state.id, interface=interface, initial_message_sequence=init_messages, actor=actor)
-
-        in_memory_agent_state = self.agent_manager.get_agent_by_id(agent_state.id, actor=actor)
-        return in_memory_agent_state
-
-    # TODO: This is not good!
-    # TODO: Ideally, this should ALL be handled by the ORM
-    # TODO: The main blocker here IS the _message updates
-    def update_agent(
-        self,
-        agent_id: str,
-        request: UpdateAgent,
-        actor: User,
-    ) -> AgentState:
-        """Update the agents core memory block, return the new state"""
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # Update tags
-        if request.tags is not None:  # Allow for empty list
-            letta_agent.agent_state.tags = request.tags
-
-        # update the system prompt
-        if request.system:
-            letta_agent.update_system_prompt(request.system)
-
-        # update in-context messages
-        if request.message_ids:
-            # This means the user is trying to change what messages are in the message buffer
-            # Internally this requires (1) pulling from recall,
-            # then (2) setting the attributes ._messages and .state.message_ids
-            letta_agent.set_message_buffer(message_ids=request.message_ids)
-
-        # tools
-        if request.tool_ids:
-            # Replace tools and also re-link
-
-            # (1) get tools + make sure they exist
-            # Current and target tools as sets of tool names
-            current_tools = letta_agent.agent_state.tools
-            current_tool_ids = set([t.id for t in current_tools])
-            target_tool_ids = set(request.tool_ids)
-
-            # Calculate tools to add and remove
-            tool_ids_to_add = target_tool_ids - current_tool_ids
-            tools_ids_to_remove = current_tool_ids - target_tool_ids
-
-            # update agent tool list
-            for tool_id in tools_ids_to_remove:
-                self.remove_tool_from_agent(agent_id=agent_id, tool_id=tool_id, user_id=actor.id)
-            for tool_id in tool_ids_to_add:
-                self.add_tool_to_agent(agent_id=agent_id, tool_id=tool_id, user_id=actor.id)
-
-            # reload agent
-            letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # configs
-        if request.llm_config:
-            letta_agent.agent_state.llm_config = request.llm_config
-        if request.embedding_config:
-            letta_agent.agent_state.embedding_config = request.embedding_config
-
-        # other minor updates
-        if request.name:
-            letta_agent.agent_state.name = request.name
-        if request.metadata_:
-            letta_agent.agent_state.metadata_ = request.metadata_
-
-        # save the agent
-        save_agent(letta_agent)
-        # TODO: probably reload the agent somehow?
-        return letta_agent.agent_state
-
-    def get_tools_from_agent(self, agent_id: str, user_id: Optional[str]) -> List[Tool]:
-        """Get tools from an existing agent"""
-        # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        actor = self.user_manager.get_user_or_default(user_id=user_id)
-
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return letta_agent.agent_state.tools
-
-    def add_tool_to_agent(
-        self,
-        agent_id: str,
-        tool_id: str,
-        user_id: str,
-    ):
-        """Add tools from an existing agent"""
-        # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        actor = self.user_manager.get_user_or_default(user_id=user_id)
-
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # Get all the tool objects from the request
-        tool_objs = []
-        tool_obj = self.tool_manager.get_tool_by_id(tool_id=tool_id, actor=actor)
-        assert tool_obj, f"Tool with id={tool_id} does not exist"
-        tool_objs.append(tool_obj)
-
-        for tool in letta_agent.agent_state.tools:
-            tool_obj = self.tool_manager.get_tool_by_id(tool_id=tool.id, actor=actor)
-            assert tool_obj, f"Tool with id={tool.id} does not exist"
-
-            # If it's not the already added tool
-            if tool_obj.id != tool_id:
-                tool_objs.append(tool_obj)
-
-        # replace the list of tool names ("ids") inside the agent state
-        letta_agent.agent_state.tools = tool_objs
-
-        # then attempt to link the tools modules
-        letta_agent.link_tools(tool_objs)
-
-        # save the agent
-        save_agent(letta_agent)
-        return letta_agent.agent_state
-
-    def remove_tool_from_agent(
-        self,
-        agent_id: str,
-        tool_id: str,
-        user_id: str,
-    ):
-        """Remove tools from an existing agent"""
-        # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        actor = self.user_manager.get_user_or_default(user_id=user_id)
-
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # Get all the tool_objs
-        tool_objs = []
-        for tool in letta_agent.agent_state.tools:
-            tool_obj = self.tool_manager.get_tool_by_id(tool_id=tool.id, actor=actor)
-            assert tool_obj, f"Tool with id={tool.id} does not exist"
-
-            # If it's not the tool we want to remove
-            if tool_obj.id != tool_id:
-                tool_objs.append(tool_obj)
-
-        # replace the list of tool names ("ids") inside the agent state
-        letta_agent.agent_state.tools = tool_objs
-
-        # then attempt to link the tools modules
-        letta_agent.link_tools(tool_objs)
-
-        # save the agent
-        save_agent(letta_agent)
-        return letta_agent.agent_state
-
     # convert name->id
 
+    # TODO: These can be moved to agent_manager
     def get_agent_memory(self, agent_id: str, actor: User) -> Memory:
         """Return the memory of an agent (core memory)"""
-        agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return agent.agent_state.memory
+        return self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor).memory
 
     def get_archival_memory_summary(self, agent_id: str, actor: User) -> ArchivalMemorySummary:
-        agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return ArchivalMemorySummary(size=agent.passage_manager.size(actor=self.default_user))
+        return ArchivalMemorySummary(size=self.agent_manager.passage_size(actor=actor, agent_id=agent_id))
 
     def get_recall_memory_summary(self, agent_id: str, actor: User) -> RecallMemorySummary:
-        agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return RecallMemorySummary(size=len(agent.message_manager))
-
-    def get_in_context_messages(self, agent_id: str, actor: User) -> List[Message]:
-        """Get the in-context messages in the agent's memory"""
-        # Get the agent object (loaded in memory)
-        agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return agent._messages
+        return RecallMemorySummary(size=self.message_manager.size(actor=actor, agent_id=agent_id))
 
     def get_agent_archival(self, user_id: str, agent_id: str, cursor: Optional[str] = None, limit: int = 50) -> List[Passage]:
         """Paginated query of all messages in agent archival memory"""
         # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
         actor = self.user_manager.get_user_or_default(user_id=user_id)
 
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
+        passages = self.agent_manager.list_passages(agent_id=agent_id, actor=actor)
 
-        # iterate over records
-        records = letta_agent.passage_manager.list_passages(
-            actor=actor,
-            agent_id=agent_id,
-            cursor=cursor,
-            limit=limit,
-        )
-
-        return records
+        return passages
 
     def get_agent_archival_cursor(
         self,
@@ -1012,38 +804,29 @@ class SyncServer(Server):
         # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
         actor = self.user_manager.get_user_or_default(user_id=user_id)
 
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
         # iterate over records
-        records = letta_agent.passage_manager.list_passages(
-            actor=self.default_user,
+        records = self.agent_manager.list_passages(
+            actor=actor,
             agent_id=agent_id,
             cursor=cursor,
             limit=limit,
+            ascending=not reverse,
         )
         return records
 
     def insert_archival_memory(self, agent_id: str, memory_contents: str, actor: User) -> List[Passage]:
         # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
+        agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=actor)
         # Insert into archival memory
-        passages = self.passage_manager.insert_passage(
-            agent_state=letta_agent.agent_state, agent_id=agent_id, text=memory_contents, actor=actor
-        )
-
-        save_agent(letta_agent)
+        # TODO: @mindy look at moving this to agent_manager to avoid above extra call
+        passages = self.passage_manager.insert_passage(agent_state=agent_state, agent_id=agent_id, text=memory_contents, actor=actor)
 
         return passages
 
-    def delete_archival_memory(self, agent_id: str, memory_id: str, actor: User):
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # Delete by ID
+    def delete_archival_memory(self, memory_id: str, actor: User):
         # TODO check if it exists first, and throw error if not
-        letta_agent.passage_manager.delete_passage_by_id(passage_id=memory_id, actor=actor)
+        # TODO: @mindy make this return the deleted passage instead
+        self.passage_manager.delete_passage_by_id(passage_id=memory_id, actor=actor)
 
         # TODO: return archival memory
 
@@ -1060,15 +843,12 @@ class SyncServer(Server):
         assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
     ) -> Union[List[Message], List[LettaMessage]]:
         # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
+
         actor = self.user_manager.get_user_or_default(user_id=user_id)
-
-        # Get the agent object (loaded in memory)
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # iterate over records
         start_date = self.message_manager.get_message_by_id(after, actor=actor).created_at if after else None
         end_date = self.message_manager.get_message_by_id(before, actor=actor).created_at if before else None
-        records = letta_agent.message_manager.list_messages_for_agent(
+
+        records = self.message_manager.list_messages_for_agent(
             agent_id=agent_id,
             actor=actor,
             start_date=start_date,
@@ -1077,10 +857,7 @@ class SyncServer(Server):
             ascending=not reverse,
         )
 
-        assert all(isinstance(m, Message) for m in records)
-
         if not return_message_object:
-            # If we're GETing messages in reverse, we need to reverse the inner list (generated by to_letta_message)
             records = [
                 msg
                 for m in records
@@ -1105,7 +882,7 @@ class SyncServer(Server):
                     config_copy[k] = server_utils.shorten_key_middle(v, chars_each_side=5)
             return config_copy
 
-        # TODO: do we need a seperate server config?
+        # TODO: do we need a separate server config?
         base_config = vars(self.config)
         clean_base_config = clean_keys(base_config)
 
@@ -1127,16 +904,16 @@ class SyncServer(Server):
         # update the block
         self.block_manager.update_block(block_id=block.id, block_update=BlockUpdate(value=value), actor=actor)
 
-        # load agent
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        return letta_agent.agent_state.memory
+        # rebuild system prompt for agent, potentially changed
+        return self.agent_manager.rebuild_system_prompt(agent_id=agent_id, actor=actor).memory
 
     def delete_source(self, source_id: str, actor: User):
         """Delete a data source"""
         self.source_manager.delete_source(source_id=source_id, actor=actor)
 
         # delete data from passage store
-        self.passage_manager.delete_passages(actor=actor, limit=None, source_id=source_id)
+        passages_to_be_deleted = self.agent_manager.list_passages(actor=actor, source_id=source_id, limit=None)
+        self.passage_manager.delete_passages(actor=actor, passages=passages_to_be_deleted)
 
         # TODO: delete data from agent passage stores (?)
 
@@ -1166,10 +943,11 @@ class SyncServer(Server):
         agent_states = self.source_manager.list_attached_agents(source_id=source_id, actor=actor)
         for agent_state in agent_states:
             agent_id = agent_state.id
-            agent = self.load_agent(agent_id=agent_id, actor=actor)
-            curr_passage_size = self.passage_manager.size(actor=actor, agent_id=agent_id, source_id=source_id)
-            agent.attach_source(user=actor, source_id=source_id, source_manager=self.source_manager, agent_manager=self.agent_manager)
-            new_passage_size = self.passage_manager.size(actor=actor, agent_id=agent_id, source_id=source_id)
+
+            # Attach source to agent
+            curr_passage_size = self.agent_manager.passage_size(actor=actor, agent_id=agent_id)
+            self.agent_manager.attach_source(agent_id=agent_state.id, source_id=source_id, actor=actor)
+            new_passage_size = self.agent_manager.passage_size(actor=actor, agent_id=agent_id)
             assert new_passage_size >= curr_passage_size  # in case empty files are added
 
         return job
@@ -1193,61 +971,6 @@ class SyncServer(Server):
         passage_count, document_count = load_data(connector, source, self.passage_manager, self.source_manager, actor=user)
         return passage_count, document_count
 
-    def attach_source_to_agent(
-        self,
-        user_id: str,
-        agent_id: str,
-        source_id: Optional[str] = None,
-        source_name: Optional[str] = None,
-    ) -> Source:
-        # attach a data source to an agent
-        # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        actor = self.user_manager.get_user_or_default(user_id=user_id)
-        if source_id:
-            data_source = self.source_manager.get_source_by_id(source_id=source_id, actor=actor)
-        elif source_name:
-            data_source = self.source_manager.get_source_by_name(source_name=source_name, actor=actor)
-        else:
-            raise ValueError(f"Need to provide at least source_id or source_name to find the source.")
-
-        assert data_source, f"Data source with id={source_id} or name={source_name} does not exist"
-
-        # load agent
-        agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-        # attach source to agent
-        agent.attach_source(user=actor, source_id=data_source.id, source_manager=self.source_manager, agent_manager=self.agent_manager)
-
-        return data_source
-
-    def detach_source_from_agent(
-        self,
-        user_id: str,
-        agent_id: str,
-        source_id: Optional[str] = None,
-        source_name: Optional[str] = None,
-    ) -> Source:
-        # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        actor = self.user_manager.get_user_or_default(user_id=user_id)
-        if source_id:
-            source = self.source_manager.get_source_by_id(source_id=source_id, actor=actor)
-        elif source_name:
-            source = self.source_manager.get_source_by_name(source_name=source_name, actor=actor)
-        else:
-            raise ValueError(f"Need to provide at least source_id or source_name to find the source.")
-        source_id = source.id
-
-        # TODO: This should be done with the ORM?
-        # delete all Passage objects with source_id==source_id from agent's archival memory
-        agent = self.load_agent(agent_id=agent_id, actor=actor)
-        agent.passage_manager.delete_passages(actor=actor, limit=100, source_id=source_id)
-
-        # delete agent-source mapping
-        self.agent_manager.detach_source(agent_id=agent_id, source_id=source_id, actor=actor)
-
-        # return back source data
-        return source
-
     def list_data_source_passages(self, user_id: str, source_id: str) -> List[Passage]:
         warnings.warn("list_data_source_passages is not yet implemented, returning empty list.", category=UserWarning)
         return []
@@ -1262,7 +985,7 @@ class SyncServer(Server):
         for source in sources:
 
             # count number of passages
-            num_passages = self.passage_manager.size(actor=actor, source_id=source.id)
+            num_passages = self.agent_manager.passage_size(actor=actor, source_id=source.id)
 
             # TODO: add when files table implemented
             ## count number of files
@@ -1285,52 +1008,11 @@ class SyncServer(Server):
 
         return sources_with_metadata
 
-    def add_default_external_tools(self, actor: User) -> bool:
-        """Add default langchain tools. Return true if successful, false otherwise."""
-        success = True
-        tool_creates = ToolCreate.load_default_langchain_tools()
-        if tool_settings.composio_api_key:
-            tool_creates += ToolCreate.load_default_composio_tools()
-        for tool_create in tool_creates:
-            try:
-                self.tool_manager.create_or_update_tool(Tool(**tool_create.model_dump()), actor=actor)
-            except Exception as e:
-                warnings.warn(f"An error occurred while creating tool {tool_create}: {e}")
-                warnings.warn(traceback.format_exc())
-                success = False
-
-        return success
-
-    def update_agent_message(self, agent_id: str, message_id: str, request: MessageUpdate, actor: User) -> Message:
+    def update_agent_message(self, message_id: str, request: MessageUpdate, actor: User) -> Message:
         """Update the details of a message associated with an agent"""
 
         # Get the current message
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        response = letta_agent.update_message(message_id=message_id, request=request)
-        save_agent(letta_agent)
-        return response
-
-    def rewrite_agent_message(self, agent_id: str, new_text: str, actor: User) -> Message:
-
-        # Get the current message
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        response = letta_agent.rewrite_message(new_text=new_text)
-        save_agent(letta_agent)
-        return response
-
-    def rethink_agent_message(self, agent_id: str, new_thought: str, actor: User) -> Message:
-        # Get the current message
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        response = letta_agent.rethink_message(new_thought=new_thought)
-        save_agent(letta_agent)
-        return response
-
-    def retry_agent_message(self, agent_id: str, actor: User) -> List[Message]:
-        # Get the current message
-        letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-        response = letta_agent.retry_message()
-        save_agent(letta_agent)
-        return response
+        return self.message_manager.update_message_by_id(message_id=message_id, message_update=request, actor=actor)
 
     def get_organization_or_default(self, org_id: Optional[str]) -> Organization:
         """Get the organization object for org_id if it exists, otherwise return the default organization object"""
@@ -1363,32 +1045,73 @@ class SyncServer(Server):
                 warnings.warn(f"An error occurred while listing embedding models for provider {provider}: {e}")
         return embedding_models
 
+    def get_llm_config_from_handle(self, handle: str, context_window_limit: Optional[int] = None) -> LLMConfig:
+        provider_name, model_name = handle.split("/", 1)
+        provider = self.get_provider_from_name(provider_name)
+
+        llm_configs = [config for config in provider.list_llm_models() if config.model == model_name]
+        if not llm_configs:
+            raise ValueError(f"LLM model {model_name} is not supported by {provider_name}")
+        elif len(llm_configs) > 1:
+            raise ValueError(f"Multiple LLM models with name {model_name} supported by {provider_name}")
+        else:
+            llm_config = llm_configs[0]
+
+        if context_window_limit:
+            if context_window_limit > llm_config.context_window:
+                raise ValueError(f"Context window limit ({context_window_limit}) is greater than maximum of ({llm_config.context_window})")
+            llm_config.context_window = context_window_limit
+
+        return llm_config
+
+    def get_embedding_config_from_handle(
+        self, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
+    ) -> EmbeddingConfig:
+        provider_name, model_name = handle.split("/", 1)
+        provider = self.get_provider_from_name(provider_name)
+
+        embedding_configs = [config for config in provider.list_embedding_models() if config.embedding_model == model_name]
+        if not embedding_configs:
+            raise ValueError(f"Embedding model {model_name} is not supported by {provider_name}")
+        elif len(embedding_configs) > 1:
+            raise ValueError(f"Multiple embedding models with name {model_name} supported by {provider_name}")
+        else:
+            embedding_config = embedding_configs[0]
+
+        if embedding_chunk_size:
+            embedding_config.embedding_chunk_size = embedding_chunk_size
+
+        return embedding_config
+
+    def get_provider_from_name(self, provider_name: str) -> Provider:
+        providers = [provider for provider in self._enabled_providers if provider.name == provider_name]
+        if not providers:
+            raise ValueError(f"Provider {provider_name} is not supported")
+        elif len(providers) > 1:
+            raise ValueError(f"Multiple providers with name {provider_name} supported")
+        else:
+            provider = providers[0]
+
+        return provider
+
     def add_llm_model(self, request: LLMConfig) -> LLMConfig:
         """Add a new LLM model"""
 
     def add_embedding_model(self, request: EmbeddingConfig) -> EmbeddingConfig:
         """Add a new embedding model"""
 
-    def get_agent_context_window(
-        self,
-        user_id: str,
-        agent_id: str,
-    ) -> ContextWindowOverview:
-        # TODO: Thread actor directly through this function, since the top level caller most likely already retrieved the user
-        actor = self.user_manager.get_user_or_default(user_id=user_id)
-
-        # Get the current message
+    def get_agent_context_window(self, agent_id: str, actor: User) -> ContextWindowOverview:
         letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
         return letta_agent.get_context_window()
 
     def run_tool_from_source(
         self,
-        user_id: str,
+        actor: User,
         tool_args: str,
         tool_source: str,
         tool_source_type: Optional[str] = None,
         tool_name: Optional[str] = None,
-    ) -> FunctionReturn:
+    ) -> ToolReturnMessage:
         """Run a tool from source code"""
 
         try:
@@ -1411,55 +1134,28 @@ class SyncServer(Server):
 
         # Next, attempt to run the tool with the sandbox
         try:
-            sandbox_run_result = ToolExecutionSandbox(tool.name, tool_args_dict, user_id, tool_object=tool).run(agent_state=agent_state)
-            function_response = str(sandbox_run_result.func_return)
-            stdout = [s for s in sandbox_run_result.stdout if s.strip()]
-            stderr = [s for s in sandbox_run_result.stderr if s.strip()]
-
-            # expected error
-            if stderr:
-                error_msg = self.get_error_msg_for_func_return(tool.name, stderr[-1])
-                return FunctionReturn(
-                    id="null",
-                    function_call_id="null",
-                    date=get_utc_time(),
-                    status="error",
-                    function_return=error_msg,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-
-            return FunctionReturn(
+            sandbox_run_result = ToolExecutionSandbox(tool.name, tool_args_dict, actor, tool_object=tool).run(agent_state=agent_state)
+            return ToolReturnMessage(
                 id="null",
-                function_call_id="null",
+                tool_call_id="null",
                 date=get_utc_time(),
-                status="success",
-                function_return=function_response,
-                stdout=stdout,
-                stderr=stderr,
+                status=sandbox_run_result.status,
+                tool_return=str(sandbox_run_result.func_return),
+                stdout=sandbox_run_result.stdout,
+                stderr=sandbox_run_result.stderr,
             )
 
-        # unexpected error TODO(@cthomas): consolidate error handling
         except Exception as e:
-            error_msg = self.get_error_msg_for_func_return(tool.name, e)
-            return FunctionReturn(
+            func_return = get_friendly_error_msg(function_name=tool.name, exception_name=type(e).__name__, exception_message=str(e))
+            return ToolReturnMessage(
                 id="null",
-                function_call_id="null",
+                tool_call_id="null",
                 date=get_utc_time(),
                 status="error",
-                function_return=error_msg,
-                stdout=[""],
+                tool_return=func_return,
+                stdout=[],
                 stderr=[traceback.format_exc()],
             )
-
-    def get_error_msg_for_func_return(self, tool_name, exception_message):
-        # same as agent.py
-        from letta.constants import MAX_ERROR_MESSAGE_CHAR_LIMIT
-
-        error_msg = f"Error executing tool {tool_name}: {exception_message}"
-        if len(error_msg) > MAX_ERROR_MESSAGE_CHAR_LIMIT:
-            error_msg = error_msg[:MAX_ERROR_MESSAGE_CHAR_LIMIT]
-        return error_msg
 
     # Composio wrappers
     def get_composio_client(self, api_key: Optional[str] = None):
